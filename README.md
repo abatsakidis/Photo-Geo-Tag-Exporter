@@ -60,5 +60,3 @@ A web application for extracting GPS metadata from images (JPEG with EXIF data a
 This project is open source and available for modification and redistribution.
 
 ---
-
-Created with ❤️ by YourName
