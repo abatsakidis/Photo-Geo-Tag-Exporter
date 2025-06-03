@@ -1,0 +1,226 @@
+<!DOCTYPE html><html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Photo Map Exporter with GeoTIFF & EXIF</title>
+  <script src="https://cdn.jsdelivr.net/npm/exif-js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/geotiff/dist/geotiff.browser.min.js"></script>
+  <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.0/jszip.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    #dropzone {
+      border: 2px dashed #888;
+      border-radius: 10px;
+      padding: 30px;
+      text-align: center;
+      color: #666;
+      margin-bottom: 20px;
+    }
+    #dropzone.dragover { background-color: #f0f0f0; }
+    #map { height: 400px; margin-top: 20px; }
+    .preview { margin-top: 15px; display: flex; flex-wrap: wrap; gap: 10px; }
+    .preview-item {
+      border: 1px solid #ccc;
+      padding: 10px;
+      font-size: 14px;
+      max-width: 220px;
+    }
+    .preview-item img { max-width: 200px; display: block; margin-bottom: 5px; }
+    button { margin: 5px 10px 5px 0; padding: 8px 12px; font-size: 14px; cursor: pointer; }
+  </style>
+</head>
+<body>
+  <h2>Drag & Drop Images with GPS (EXIF / GeoTIFF)</h2>
+  <div id="dropzone">Drop images here or click to select</div>
+  <input type="file" id="fileInput" accept="image/*,.tif,.tiff" multiple style="display:none;" />
+  <div id="buttons" style="display:none">
+    <button id="downloadGeoJSON">Download GeoJSON</button>
+    <button id="downloadKML">Download KML</button>
+    <button id="downloadGPKG">Download GeoPackage (ZIP)</button>
+  </div>
+  <div id="map"></div>
+  <div class="preview" id="preview"></div> <script>
+    const dropzone = document.getElementById("dropzone");
+    const fileInput = document.getElementById("fileInput");
+    const previewDiv = document.getElementById("preview");
+    const downloadGeoJSON = document.getElementById("downloadGeoJSON");
+    const downloadKML = document.getElementById("downloadKML");
+    const downloadGPKG = document.getElementById("downloadGPKG");
+    const buttonsDiv = document.getElementById("buttons");
+
+    let map;
+    let geojsonFeatures = [];
+
+    function toDecimal([d, m, s], ref) {
+      let dec = d + m / 60 + s / 3600;
+      if (ref === "S" || ref === "W") dec *= -1;
+      return dec;
+    }
+
+    function createGeoJSONFeature(lat, lon, exifData, fileName) {
+      return {
+        type: "Feature",
+        geometry: { type: "Point", coordinates: [parseFloat(lon.toFixed(6)), parseFloat(lat.toFixed(6))] },
+        properties: {
+          fileName,
+          dateTime: exifData?.DateTimeOriginal || "Unknown",
+          cameraMake: exifData?.Make || "Unknown",
+          cameraModel: exifData?.Model || "Unknown"
+        }
+      };
+    }
+
+    function createKML(features) {
+      let kml = `<?xml version="1.0" encoding="UTF-8"?>\n<kml xmlns="http://www.opengis.net/kml/2.2">\n<Document>\n`;
+      for (const f of features) {
+        const p = f.properties;
+        const [lon, lat] = f.geometry.coordinates;
+        kml += `<Placemark>\n <name>${p.fileName}</name>\n <description><![CDATA[<b>Date:</b> ${p.dateTime}<br><b>Camera:</b> ${p.cameraMake} ${p.cameraModel}]]></description>\n <Point><coordinates>${lon},${lat},0</coordinates></Point>\n</Placemark>\n`;
+      }
+      kml += `</Document>\n</kml>`;
+      return kml;
+    }
+
+    async function handleTIFF(file, previewURL) {
+      const buffer = await file.arrayBuffer();
+      const tiff = await GeoTIFF.fromArrayBuffer(buffer);
+      const image = await tiff.getImage();
+      const bbox = image.getBoundingBox();
+      const projection = image.getGeoKeys()?.ProjectedCSTypeGeoKey || "WGS84";
+      if (bbox) {
+        const lat = (bbox[1] + bbox[3]) / 2;
+        const lon = (bbox[0] + bbox[2]) / 2;
+        const feature = createGeoJSONFeature(lat, lon, { Projection: projection }, file.name);
+        geojsonFeatures.push(feature);
+        previewDiv.innerHTML += `<div class='preview-item'><img src="${previewURL}"/><b>${file.name}</b><br>Lat: ${lat.toFixed(6)}, Lon: ${lon.toFixed(6)}<br>Projection: ${projection}</div>`;
+      } else {
+        previewDiv.innerHTML += `<div class='preview-item'><img src="${previewURL}"/><b>${file.name}</b><br><span style='color:red;'>No GeoTIFF GPS data</span></div>`;
+      }
+    }
+
+    function displayMap(features) {
+      if (!features.length) return;
+      const [firstLon, firstLat] = features[0].geometry.coordinates;
+
+      if (!map) {
+        map = L.map("map").setView([firstLat, firstLon], 6);
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+          attribution: '© OpenStreetMap contributors'
+        }).addTo(map);
+      }
+
+      features.forEach(f => {
+        const [lon, lat] = f.geometry.coordinates;
+        const p = f.properties;
+        const popup = `<b>${p.fileName}</b><br>${p.dateTime}<br>${p.cameraMake} ${p.cameraModel}`;
+        L.marker([lat, lon]).addTo(map).bindPopup(popup);
+      });
+    }
+
+    function handleFiles(files) {
+      geojsonFeatures = [];
+      previewDiv.innerHTML = "";
+      if (map) map.eachLayer(l => l instanceof L.Marker && map.removeLayer(l));
+
+      let processed = 0;
+      [...files].forEach(file => {
+        const reader = new FileReader();
+        reader.onload = function (e) {
+          const previewURL = e.target.result;
+
+          if (file.name.toLowerCase().endsWith(".tif") || file.name.toLowerCase().endsWith(".tiff")) {
+            handleTIFF(file, previewURL).then(() => {
+              processed++;
+              if (processed === files.length && geojsonFeatures.length) {
+                displayMap(geojsonFeatures);
+                buttonsDiv.style.display = "block";
+              }
+            });
+          } else {
+            const img = new Image();
+            img.onload = function () {
+              EXIF.getData(img, function () {
+                const lat = EXIF.getTag(this, "GPSLatitude");
+                const lon = EXIF.getTag(this, "GPSLongitude");
+                const latRef = EXIF.getTag(this, "GPSLatitudeRef");
+                const lonRef = EXIF.getTag(this, "GPSLongitudeRef");
+
+                const exifData = {
+                  DateTimeOriginal: EXIF.getTag(this, "DateTimeOriginal"),
+                  Make: EXIF.getTag(this, "Make"),
+                  Model: EXIF.getTag(this, "Model")
+                };
+
+                if (!lat || !lon || !latRef || !lonRef) {
+                  previewDiv.innerHTML += `<div class='preview-item'><img src="${previewURL}"/><b>${file.name}</b><br><span style='color:red;'>No EXIF GPS data</span></div>`;
+                  processed++;
+                  if (processed === files.length && geojsonFeatures.length) {
+                    displayMap(geojsonFeatures);
+                    buttonsDiv.style.display = "block";
+                  }
+                  return;
+                }
+
+                const latitude = toDecimal(lat, latRef);
+                const longitude = toDecimal(lon, lonRef);
+                const feature = createGeoJSONFeature(latitude, longitude, exifData, file.name);
+                geojsonFeatures.push(feature);
+
+                previewDiv.innerHTML += `<div class='preview-item'><img src="${previewURL}"/><b>${file.name}</b><br>Lat: ${latitude.toFixed(6)}, Lon: ${longitude.toFixed(6)}</div>`;
+                processed++;
+                if (processed === files.length && geojsonFeatures.length) {
+                  displayMap(geojsonFeatures);
+                  buttonsDiv.style.display = "block";
+                }
+              });
+            };
+            img.src = previewURL;
+          }
+        };
+        reader.readAsDataURL(file);
+      });
+    }
+
+    dropzone.addEventListener("click", () => fileInput.click());
+    fileInput.addEventListener("change", e => handleFiles(e.target.files));
+
+    dropzone.addEventListener("dragover", e => {
+      e.preventDefault();
+      dropzone.classList.add("dragover");
+    });
+
+    dropzone.addEventListener("dragleave", () => dropzone.classList.remove("dragover"));
+    dropzone.addEventListener("drop", e => {
+      e.preventDefault();
+      dropzone.classList.remove("dragover");
+      handleFiles(e.dataTransfer.files);
+    });
+
+    downloadGeoJSON.addEventListener("click", () => {
+      const blob = new Blob([JSON.stringify({ type: "FeatureCollection", features: geojsonFeatures }, null, 2)], { type: "application/json" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "photo_locations.geojson";
+      link.click();
+    });
+
+    downloadKML.addEventListener("click", () => {
+      const blob = new Blob([createKML(geojsonFeatures)], { type: "application/vnd.google-earth.kml+xml" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "photo_locations.kml";
+      link.click();
+    });
+
+    downloadGPKG.addEventListener("click", async () => {
+      const zip = new JSZip();
+      zip.file("photo_locations.geojson", JSON.stringify({ type: "FeatureCollection", features: geojsonFeatures }, null, 2));
+      const blob = await zip.generateAsync({ type: "blob" });
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = "geopackage_export.zip";
+      link.click();
+    });
+  </script></body>
+</html>
